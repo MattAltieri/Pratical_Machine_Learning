@@ -1,0 +1,267 @@
+---
+title: "Practical Machine Learning PA"
+author: "Gerard NIGNON"
+date: "19 septembre 2015"
+output: 
+    html_document:
+        toc: true
+---
+
+###Background
+
+
+This human activity recognition research has traditionally focused on discriminating between different activities, i.e. to predict "which" activity was performed at a specific point in time (like with the Daily Living Activities dataset above). The approach we propose for the Weight Lifting Exercises dataset is to investigate "how (well)" an activity was performed by the wearer. The "how (well)" investigation has only received little attention so far, even though it potentially provides useful information for a large variety of applications,such as sports training.
+
+In this work (see the paper) we first define quality of execution and investigate three aspects that pertain to qualitative activity recognition: the problem of specifying correct execution, the automatic and robust detection of execution mistakes, and how to provide feedback on the quality of execution to the user. We tried out an on-body sensing approach (dataset here), but also an "ambient sensing approach" (by using Microsoft Kinect - dataset still unavailable)
+
+Six young health participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E).
+
+Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes. Participants were supervised by an experienced weight lifter to make sure the execution complied to the manner they were supposed to simulate. The exercises were performed by six male participants aged between 20-28 years, with little weight lifting experience. We made sure that all participants could easily simulate the mistakes in a safe and controlled manner by using a relatively light dumbbell (1.25kg).
+
+
+
+Read more: http://groupware.les.inf.puc-rio.br/har#ixzz3mUwnUFrh 
+
+
+
+### Data Processing
+
+
+
+The training data for this project are available here: 
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+The test data are available here: 
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+The data for this project come from this source: http://groupware.les.inf.puc-rio.br/har.
+
+
+###Packages and libraries
+
+```{r echo=T, results='hide',message=FALSE,warning=FALSE}
+packages <- c("dplyr", "knitr", "caret", "ggplot2", "randomForest", "randomForest")
+sapply(packages, require, character.only = TRUE, quietly = TRUE)
+library(dplyr)
+library(knitr)
+library(caret)
+library(ggplot2)
+library(randomForest)
+library(MASS)
+library(parallel, quietly=T)
+library(doParallel, quietly=T)
+```
+
+
+
+### Loading the data
+        
+```{r}
+fileUrlTraining <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+if(!file.exists("pml-training.csv")){
+        download.file(fileUrlTraining, destfile = ./pml-training.csv, method = curl)
+}
+fileUrlTesting <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+if(!file.exists("pml-testing.csv")){
+        download.file(fileUrlTest, destfile = ./pml-testing.csv, method = curl)
+}
+training <- as.data.frame(read.csv("pml-training.csv", na.strings=c("", "NA", "#DIV/0!"), stringsAsFactors = FALSE))
+
+testing <- as.data.frame(read.csv("pml-testing.csv", na.strings=c("", "NA", "#DIV/0!"), stringsAsFactors = FALSE))
+
+```
+
+
+
+```{r echo=T,message=FALSE,warning=FALSE}
+dim(training)
+dim(testing)
+```
+
+
+The training dataset contains 160 variables with 19622 observations, and the testing dataset contains 160 variables with 20 observations. When Loading the data I just set the "", "NA" and "#DIV/0!" to missing values by adding it to the vector of na.strings in my initial call to read.csv()
+
+
+
+### Pre-Processing the data
+
+Before we start running our model, we first need to wrangle our data. 
+By looking the output of a summary in our console, we won't show it, we can observe that they are lots of `NA's` and `Zero`, and some variable contain only those values.
+We will remove all the variables who have more than 95% of data missing from the dataset. We need to remove predictors that have unique value, or unique value plus missing value (like 0 and NA), across the data. 
+Also the `X` variable, which is just a sequence, need to be removed. This kind of predictor is not only non-informative, it can break our model.The variable `user_name` listing the names of the participants, and the variables indicating date and time when the activity was performed won't contribute to the classification, we will removed them from the dataset, along with: `raw_timestamp_part_1`, `raw_timestamp_part_2`, `cvtd_timestamp`, `new_window` and `num_window`.
+
+Datasets come sometimes with predictors that take an unique value across samples
+
+The last part, of processing the data, is to convert the variable `classe` into factor.
+
+```{r echo=T, results='hide',message=FALSE,warning=FALSE}
+summary(training)
+summary(testing)
+```
+
+```{r echo=T, results='hide',message=FALSE,warning=FALSE}
+
+## removing all the variables who have more than 95% of data missing 
+
+ColumnWithNA <- apply(training,2,function(x) {sum(is.na(x))})
+training <- training[,which(ColumnWithNA <  nrow(training)*0.95)]
+
+## removing variables not usufull for or model
+
+IrrelevantVariables <- names(training) %in% c("X", "user_name",  "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window") 
+training <- training[!IrrelevantVariables]
+
+## removing predictors that take an unique value across samples
+
+ZeroVar <- nearZeroVar(training, saveMetrics = TRUE)
+training <- training[, ZeroVar$nzv==FALSE]
+
+## transforming classe into factor
+
+training$classe <- factor(training$classe)
+
+```
+
+```{r echo=T,message=FALSE,warning=FALSE}
+dim(training)
+dim(testing)
+```
+
+### Data Partitioning
+
+The training data is splitted in two parts, a new training and a test. We did this because the the test set provided is using different variables.   
+
+```{r echo=T,message=FALSE,warning=FALSE}
+set.seed(123)
+
+inTrain = createDataPartition(training$classe, p = 0.6)[[1]]
+training.new <- training[inTrain,]
+testing.new <- training[-inTrain,]
+```
+
+```{r echo=T,message=FALSE,warning=FALSE}
+table(training.new$classe)
+```
+
+### Bulding the Model
+
+We will try two methods for building our prediction models. We choose the two of the most powerfull ones: Random Forests and Gradient Boosting. We decide to save and load your model(s) instead of recalculating them each time through a rda files.  
+
+
+#### Training set 
+
+```{r echo=T,message=FALSE,warning=FALSE, cache=TRUE}
+set.seed(123)
+if (file.exists("fit_gbm2.rda")) {
+load("fit_gbm2.rda")} else {fit_gbm <- train(classe ~ ., method = "gbm", data = training.new,verbose=F )
+save(fit_gbm, file="fit_gbm2.rda")}
+if (file.exists("fit_rf2.rda")) {
+load("fit_rf2.rda")} else {fit_rf <- train(classe ~ ., method = "rf", data = training.new, verbose=F)
+save(fit_rf, file="fit_rf2.rda")}
+
+
+gbm_accuracy <- confusionMatrix(testing.new$classe, predict(fit_gbm, newdata=testing.new))
+rf_accuracy <- confusionMatrix(testing.new$classe, predict(fit_rf, newdata=testing.new))
+
+
+```
+
+#### Gradient Boosting
+
+Gradient boosting produces a prediction model in the form of an ensemble of weak prediction models, typically decision trees. It builds the model in a stage-wise fashion like other boosting methods do, and it generalizes them by allowing optimization of an arbitrary differentiable loss function.
+
+##### Cross Validation and sample error
+
+```{r echo=T,message=FALSE,warning=FALSE, cache=TRUE}
+gbm_accuracy
+
+```
+
+
+```{r echo=T,message=FALSE,warning=FALSE, cache=TRUE}
+
+accuracy <- gbm_accuracy$overall['Accuracy']
+accurancy_rates <- c(accuracy, 1 - accuracy); names(accurancy_rates) <- c('Accuracy', 'Error.Rate')
+accurancy_rates
+```
+
+
+
+#### Random Forests
+
+Random forests operate by constructing a multitude of decision trees at training time and outputting the class that is the mode of the classes (classification) or mean prediction (regression) of the individual trees. Random forests correct for decision trees' habit of overfitting to their training set.
+
+##### Cross Validation and sample error
+
+```{r echo=T,message=FALSE,warning=FALSE, cache=TRUE}
+
+rf_accuracy
+
+```
+
+```{r echo=T,message=FALSE,warning=FALSE, cache=TRUE}
+
+accuracy <- rf_accuracy$overall['Accuracy']
+accurancy_rates <- c(accuracy, 1 - accuracy); names(accurancy_rates) <- c('Accuracy', 'Error.Rate')
+accurancy_rates
+```
+
+
+
+Both methods Gradient Boosting and Random Forests, considering all the pre-processing, are highly accurate. Let's do a comparison:
+
+```{r echo=T,message=FALSE,warning=FALSE, cache=TRUE}
+
+resampls = resamples(list(RF = fit_rf, GBM = fit_gbm))
+difValues = diff(resampls)
+summary(difValues)
+```
+
+The difference is statistically significant. The GBM value is less accurate than the RF.
+We will stuck with the Ramdom Forest Model for the Testing.
+
+
+To see variables that were the most informative in making distinctions between classes, we will compute `variable importance`.  The results for the random forest model follow:
+
+```{r echo=T,message=FALSE,warning=FALSE, cache=TRUE}
+
+rfImp <- varImp(fit_rf, scale=FALSE)
+plot(rfImp, top = 20)
+```
+
+
+
+### Prediction Assignment Submission
+
+Finally let see the results of our random forest model if we apply it on the testing set
+
+```{r echo=T,message=FALSE,warning=FALSE, cache=TRUE}
+results <- predict(fit_rf, testing)
+results
+```
+
+The result is identical to the expected outcome.
+
+
+```{r echo=T,message=FALSE,warning=FALSE, cache=TRUE}
+pml_write_files <- function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+pml_write_files(results)
+```
+
+### Resources:
+
+
+https://en.wikipedia.org/wiki/Gradient_boosting
+
+https://en.wikipedia.org/wiki/Random_forest
+
+http://groupware.les.inf.puc-rio.br/work.jsf?p1=10335
